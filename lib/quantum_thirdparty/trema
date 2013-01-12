@@ -1,0 +1,153 @@
+# lib/trema
+
+# Trema (OpenFlow Controller Framework)
+TREMA_REPO=${TREMA_REPO:-https://github.com/trema/trema.git}
+TREMA_BRANCH=${TREMA_BRANCH:-master}
+
+# Trema Sliceable Switch (OpenFlow Controller)
+TREMA_APPS_REPO=${TREMA_APPS_REPO:-https://github.com/trema/apps.git}
+TREMA_APPS_BRANCH=${TREMA_APPS_BRANCH:-master}
+
+# Save trace setting
+XTRACE=$(set +o | grep xtrace)
+set +o xtrace
+
+TREMA_DIR=${TREMA_DIR:-$DEST/trema}
+TREMA_VAR_DIR=${TREMA_VAR_DIR:-$TREMA_DIR/var}
+TREMA_TMP_DIR=${TREMA_TMP_DIR:-$TREMA_DIR/tmp}
+TREMA_SS_DIR="$TREMA_DIR/apps/sliceable_switch"
+
+TREMA_LOG_LEVEL=${TREMA_LOG_LEVEL:-info}
+
+function configure_trema() {
+    # prepare dir
+    for dir in apache db log script; do
+        mkdir -p $TREMA_VAR_DIR/$dir
+    done
+    sudo mkdir -p $TREMA_TMP_DIR
+    if [ ! -w $TREMA_VAR_DIR ]; then
+        sudo chown -R `whoami` $TREMA_VAR_DIR
+    fi
+
+    # configure HTTP Server for sliceable_switch
+    _generate_sliceable_switch_apache_config $TREMA_VAR_DIR/apache/sliceable_switch
+}
+
+# init_trema - Initialize databases, etc.
+function init_trema() {
+    local _pwd=$(pwd)
+    cd $TREMA_SS_DIR
+    rm -f filter.db  slice.db
+    ./create_tables.sh
+    mv filter.db  slice.db $TREMA_VAR_DIR/db/
+    cp Slice.pm Filter.pm config.cgi $TREMA_VAR_DIR/script/
+    cd $_pwd
+    sed -i -e "s|/home/sliceable_switch/db|$TREMA_VAR_DIR/db|" \
+        $TREMA_VAR_DIR/script/config.cgi
+    cp $TREMA_SS_DIR/sliceable_switch_null.conf $TREMA_VAR_DIR/sliceable.conf
+    sed -i -e "s|../apps/sliceable_switch/slice.db|$TREMA_VAR_DIR/db/slice.db|" \
+           -e "s|../apps/sliceable_switch/filter.db|$TREMA_VAR_DIR/db/filter.db|" \
+           $TREMA_VAR_DIR/sliceable.conf
+    sudo chown -R www-data.www-data $TREMA_VAR_DIR
+
+}
+
+function install_trema() {
+    sudo gem install gli
+    git_clone $TREMA_REPO $TREMA_DIR/trema $TREMA_BRANCH
+    git_clone $TREMA_APPS_REPO $TREMA_DIR/apps $TREMA_APPS_BRANCH
+
+    # build
+    local _pwd=$(pwd)
+    cd $TREMA_DIR/trema
+    ./build.rb
+    cd $_pwd
+    make -C $TREMA_DIR/apps/topology
+    make -C $TREMA_DIR/apps/flow_manager
+    make -C $TREMA_DIR/apps/sliceable_switch
+}
+
+function start_trema() {
+    # APACHE_NAME is defined in init_horizon (in lib/horizon)
+    restart_service $APACHE_NAME
+
+    # start trema
+    local _pwd=$(pwd)
+    cd $TREMA_DIR/trema
+    sudo LOGGING_LEVEL=$TREMA_LOG_LEVEL TREMA_TMP=$TREMA_TMP_DIR \
+        ./trema run -d -c $TREMA_VAR_DIR/sliceable.conf
+    cd $_pwd
+}
+
+function stop_trema() {
+    local _pwd=$(pwd)
+    cd $TREMA_DIR/trema
+    sudo TREMA_TMP=$TREMA_TMP_DIR ./trema killall
+    cd $_pwd
+}
+
+function setup_ovs_tunnels() {
+    local id=0
+    if [ -n "$GRE_REMOTE_IPS" ]; then
+         for ip in ${GRE_REMOTE_IPS//:/ }
+         do
+             sudo ovs-vsctl --no-wait add-port $OVS_BRIDGE gre$id -- \
+                 set Interface gre$id type=gre options:remote_ip=$ip
+             id=`expr $id + 1`
+         done
+    fi
+}
+
+function _generate_sliceable_switch_apache_config() {
+    local config=$1
+    cat > $config << 'END'
+Listen 8888
+
+<VirtualHost *:8888>
+
+    DocumentRoot @VAR@/script
+
+    <Directory />
+        Options FollowSymLinks
+        AllowOverride None
+        Order deny,allow
+        Deny from all
+    </Directory>
+
+    <Directory @VAR@/script/>
+        Options +ExecCGI
+        Script GET /config.cgi
+        Script PUT /config.cgi
+        Script POST /config.cgi
+        Script DELETE /config.cgi
+        AllowOverride None
+        Order deny,allow
+        Deny from all
+    </Directory>
+
+    <Location ~ "/(networks|filters)">
+        Order allow,deny
+        Allow from all
+    </Location>
+
+    RewriteEngine on
+    RewriteRule ^/tenants/[^/]*/networks(.*)$  /networks$1? [QSA,PT]
+    RewriteRule ^/tenants/[^/]*/filters(.*)$  /filters$1? [QSA,PT]
+    RewriteRule ^/networks(.*)$ /networks$1? [QSA,L]
+    RewriteRule ^/filters(.*)$ /filters$1? [QSA,L]
+
+    AddHandler cgi-script .cgi
+
+    ErrorLog @VAR@/log/sliceable_switch_error.log
+    CustomLog @VAR@/log/sliceable_switch_access.log combined
+
+</VirtualHost>
+END
+    sudo sed -i -e "s|@VAR@|$TREMA_VAR_DIR|" $config
+    sudo ln -sf $config /etc/apache2/sites-available
+    sudo a2enmod rewrite actions
+    sudo a2ensite sliceable_switch
+}
+
+# Restore xtrace
+$XTRACE
