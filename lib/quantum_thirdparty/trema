@@ -1,8 +1,12 @@
-# lib/trema
+# Trema Sliceable Switch
+# ----------------------
 
-# Trema (OpenFlow Controller Framework)
-TREMA_REPO=${TREMA_REPO:-https://github.com/trema/trema.git}
-TREMA_BRANCH=${TREMA_BRANCH:-master}
+# Trema is a Full-Stack OpenFlow Framework in Ruby and C
+# https://github.com/trema/trema
+#
+# Trema Sliceable Switch is an OpenFlow controller which provides
+# virtual layer-2 network slices.
+# https://github.com/trema/apps/wiki
 
 # Trema Sliceable Switch (OpenFlow Controller)
 TREMA_APPS_REPO=${TREMA_APPS_REPO:-https://github.com/trema/apps.git}
@@ -13,55 +17,67 @@ XTRACE=$(set +o | grep xtrace)
 set +o xtrace
 
 TREMA_DIR=${TREMA_DIR:-$DEST/trema}
-TREMA_VAR_DIR=${TREMA_VAR_DIR:-$TREMA_DIR/var}
-TREMA_TMP_DIR=${TREMA_TMP_DIR:-$TREMA_DIR/tmp}
 TREMA_SS_DIR="$TREMA_DIR/apps/sliceable_switch"
+
+TREMA_DATA_DIR=${TREMA_DATA_DIR:-$DATA_DIR/trema}
+TREMA_SS_ETC_DIR=$TREMA_DATA_DIR/sliceable_switch/etc
+TREMA_SS_DB_DIR=$TREMA_DATA_DIR/sliceable_switch/db
+TREMA_SS_SCRIPT_DIR=$TREMA_DATA_DIR/sliceable_switch/script
+TREMA_TMP_DIR=$TREMA_DATA_DIR/trema
 
 TREMA_LOG_LEVEL=${TREMA_LOG_LEVEL:-info}
 
+TREMA_SS_CONFIG=$TREMA_SS_ETC_DIR/sliceable.conf
+TREMA_SS_APACHE_CONFIG=/etc/apache2/sites-available/sliceable_switch
+
+# configure_trema - Set config files, create data dirs, etc
 function configure_trema() {
     # prepare dir
-    for dir in apache db log script; do
-        mkdir -p $TREMA_VAR_DIR/$dir
+    for d in $TREMA_SS_ETC_DIR $TREMA_SS_DB_DIR $TREMA_SS_SCRIPT_DIR; do
+        sudo mkdir -p $d
+        sudo chown -R `whoami` $d
     done
     sudo mkdir -p $TREMA_TMP_DIR
-    if [ ! -w $TREMA_VAR_DIR ]; then
-        sudo chown -R `whoami` $TREMA_VAR_DIR
-    fi
-
-    # configure HTTP Server for sliceable_switch
-    _generate_sliceable_switch_apache_config $TREMA_VAR_DIR/apache/sliceable_switch
 }
 
 # init_trema - Initialize databases, etc.
 function init_trema() {
     local _pwd=$(pwd)
-    cd $TREMA_SS_DIR
-    rm -f filter.db  slice.db
-    ./create_tables.sh
-    mv filter.db  slice.db $TREMA_VAR_DIR/db/
-    cp Slice.pm Filter.pm config.cgi $TREMA_VAR_DIR/script/
-    cd $_pwd
-    sed -i -e "s|/home/sliceable_switch/db|$TREMA_VAR_DIR/db|" \
-        $TREMA_VAR_DIR/script/config.cgi
-    cp $TREMA_SS_DIR/sliceable_switch_null.conf $TREMA_VAR_DIR/sliceable.conf
-    sed -i -e "s|../apps/sliceable_switch/slice.db|$TREMA_VAR_DIR/db/slice.db|" \
-           -e "s|../apps/sliceable_switch/filter.db|$TREMA_VAR_DIR/db/filter.db|" \
-           $TREMA_VAR_DIR/sliceable.conf
-    sudo chown -R www-data.www-data $TREMA_VAR_DIR
 
+    # Initialize databases for Sliceable Switch
+    cd $TREMA_SS_DIR
+    rm -f filter.db slice.db
+    ./create_tables.sh
+    mv filter.db slice.db $TREMA_SS_DB_DIR
+    # Make sure that apache cgi has write access to the databases
+    sudo chown -R www-data.www-data $TREMA_SS_DB_DIR
+    cd $_pwd
+
+    # Setup HTTP Server for sliceable_switch
+    cp $TREMA_SS_DIR/{Slice.pm,Filter.pm,config.cgi} $TREMA_SS_SCRIPT_DIR
+    sed -i -e "s|/home/sliceable_switch/db|$TREMA_SS_DB_DIR|" \
+        $TREMA_SS_SCRIPT_DIR/config.cgi
+
+    sudo cp $TREMA_SS_DIR/apache/sliceable_switch $TREMA_SS_APACHE_CONFIG
+    sudo sed -i -e "s|/home/sliceable_switch/script|$TREMA_SS_SCRIPT_DIR|" \
+        $TREMA_SS_APACHE_CONFIG
+    sudo a2enmod rewrite actions
+    sudo a2ensite sliceable_switch
+
+    cp $TREMA_SS_DIR/sliceable_switch_null.conf $TREMA_SS_CONFIG
+    sed -i -e "s|\.\./apps/sliceable_switch/slice.db|$TREMA_SS_DB_DIR/slice.db|" \
+           -e "s|\.\./apps/sliceable_switch/filter.db|$TREMA_SS_DB_DIR/filter.db|" \
+           -e "s|\.\./apps/|$TREMA_DIR/apps/|" \
+           $TREMA_SS_CONFIG
 }
 
 function install_trema() {
-    sudo gem install gli
-    git_clone $TREMA_REPO $TREMA_DIR/trema $TREMA_BRANCH
+    # Trema
+    if ! gem list | grep '^trema '; then
+        sudo gem install --no-ri --no-rdoc trema
+    fi
+    # Sliceable Switch
     git_clone $TREMA_APPS_REPO $TREMA_DIR/apps $TREMA_APPS_BRANCH
-
-    # build
-    local _pwd=$(pwd)
-    cd $TREMA_DIR/trema
-    ./build.rb
-    cd $_pwd
     make -C $TREMA_DIR/apps/topology
     make -C $TREMA_DIR/apps/flow_manager
     make -C $TREMA_DIR/apps/sliceable_switch
@@ -71,19 +87,12 @@ function start_trema() {
     # APACHE_NAME is defined in init_horizon (in lib/horizon)
     restart_service $APACHE_NAME
 
-    # start trema
-    local _pwd=$(pwd)
-    cd $TREMA_DIR/trema
     sudo LOGGING_LEVEL=$TREMA_LOG_LEVEL TREMA_TMP=$TREMA_TMP_DIR \
-        ./trema run -d -c $TREMA_VAR_DIR/sliceable.conf
-    cd $_pwd
+        trema run -d -c $TREMA_SS_CONFIG
 }
 
 function stop_trema() {
-    local _pwd=$(pwd)
-    cd $TREMA_DIR/trema
-    sudo TREMA_TMP=$TREMA_TMP_DIR ./trema killall
-    cd $_pwd
+    sudo TREMA_TMP=$TREMA_TMP_DIR trema killall
 }
 
 function setup_ovs_tunnels() {
@@ -96,57 +105,6 @@ function setup_ovs_tunnels() {
              id=`expr $id + 1`
          done
     fi
-}
-
-function _generate_sliceable_switch_apache_config() {
-    local config=$1
-    cat > $config << 'END'
-Listen 8888
-
-<VirtualHost *:8888>
-
-    DocumentRoot @VAR@/script
-
-    <Directory />
-        Options FollowSymLinks
-        AllowOverride None
-        Order deny,allow
-        Deny from all
-    </Directory>
-
-    <Directory @VAR@/script/>
-        Options +ExecCGI
-        Script GET /config.cgi
-        Script PUT /config.cgi
-        Script POST /config.cgi
-        Script DELETE /config.cgi
-        AllowOverride None
-        Order deny,allow
-        Deny from all
-    </Directory>
-
-    <Location ~ "/(networks|filters)">
-        Order allow,deny
-        Allow from all
-    </Location>
-
-    RewriteEngine on
-    RewriteRule ^/tenants/[^/]*/networks(.*)$  /networks$1? [QSA,PT]
-    RewriteRule ^/tenants/[^/]*/filters(.*)$  /filters$1? [QSA,PT]
-    RewriteRule ^/networks(.*)$ /networks$1? [QSA,L]
-    RewriteRule ^/filters(.*)$ /filters$1? [QSA,L]
-
-    AddHandler cgi-script .cgi
-
-    ErrorLog @VAR@/log/sliceable_switch_error.log
-    CustomLog @VAR@/log/sliceable_switch_access.log combined
-
-</VirtualHost>
-END
-    sudo sed -i -e "s|@VAR@|$TREMA_VAR_DIR|" $config
-    sudo ln -sf $config /etc/apache2/sites-available
-    sudo a2enmod rewrite actions
-    sudo a2ensite sliceable_switch
 }
 
 # Restore xtrace
